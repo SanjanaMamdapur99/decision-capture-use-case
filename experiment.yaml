@@ -1,0 +1,22 @@
+# Default laptop configuration. Any OpenAI-compatible endpoint can be substituted.
+database_path: data/financial/financial.sqlite
+output_dir: runs
+
+# Two repaid and two defaulted historical cases, all late enough to have prior comparables.
+loan_ids: [5358, 5856, 6934, 5338]
+
+model:
+  name: llama3.1:8b
+  base_url: http://localhost:11434/v1
+  api_key_env: DECISION_LLM_API_KEY
+  temperature: 0
+  max_tokens: 1800
+
+workflow:
+  # provenance captures tool results and per-item evidence verdicts; baseline pastes the
+  # same evidence into the prompt but records only candidates, assessments and selection.
+  capture_mode: provenance
+  start_persistence: false
+  prompt_item_chars: 1200
+  recent_transaction_limit: 12
+  comparable_loan_limit: 8

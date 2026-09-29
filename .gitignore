@@ -5,3 +5,5 @@ __pycache__/
 runs/
 settings.yaml
 *.db
+.DS_Store
+data/financial/financial.sqlite
