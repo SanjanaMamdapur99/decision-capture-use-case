@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "flowcept[llm_agent,mongo] @ git+https://github.com/ioannakaragiannifsti/flowcept.git@feature/decision-provenance",
+    "pydantic",
     "pyyaml",
 ]
 

@@ -6,11 +6,13 @@ output_dir: runs
 loan_ids: [5358, 5856, 6934, 5338]
 
 model:
-  name: llama3.1:8b
+  # Qwen3 supports both tool calls and structured responses through Ollama.
+  name: qwen3:8b
   base_url: http://localhost:11434/v1
   api_key_env: DECISION_LLM_API_KEY
   temperature: 0
   max_tokens: 1800
+  reasoning_effort: none
 
 workflow:
   # provenance captures tool results and per-item evidence verdicts; baseline pastes the

@@ -2,22 +2,20 @@
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from flowcept import DecisionCapture, Flowcept, FlowceptTask, retrieval_scope
+from flowcept.instrumentation.flowcept_agent_task import FlowceptLLM
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 
 from decision_use_case.config import ExperimentConfig, ModelSettings
 from decision_use_case.database import FinancialRepository
 from decision_use_case.metrics import compute_decision_metrics, evaluate_recommendation
-from decision_use_case.tools import FinancialTools, build_financial_tools
-
-
-RISK_CANDIDATES = ("low_risk", "high_risk", "manual_review")
-FAIRNESS_CANDIDATES = ("acceptable", "bias_concern", "insufficient_evidence")
-COMMITTEE_CANDIDATES = ("approve", "decline", "manual_review")
+from decision_use_case.tools import SCHEMA_TO_TOOL, TOOL_SCHEMAS, FinancialTools, build_financial_tools
 
 
 @dataclass(frozen=True)
@@ -45,20 +43,87 @@ def build_model(settings: ModelSettings):
     return ChatOpenAI(**arguments)
 
 
-def _decision_context(role: str, question: str, candidate_ids: tuple[str, ...], model_name: str) -> dict:
-    return {
-        "research_role": role,
-        "question": question,
-        "model": model_name,
-        "required_candidate_ids": list(candidate_ids),
-        "instructions": [
-            f"Return exactly these candidates and assess each one: {list(candidate_ids)}.",
-            "Select exactly one candidate.",
-            "Treat assessment scores as comparative confidence from 0 to 1, not calibrated probabilities.",
-            "Base conclusions only on evidence marked used and explicitly acknowledge contradictory evidence.",
-            "Do not infer facts absent from the supplied evidence.",
-        ],
-    }
+def _choose_and_run_tools(
+    *,
+    request: str,
+    available_tool_names: tuple[str, ...],
+    functions: dict,
+    loan_id: int,
+    model,
+    agent_id: str,
+    workflow_id: str,
+    parent_task_id: str,
+    capture_mode: str,
+) -> list[dict]:
+    """Let the model author and execute calls from the agent's available tools."""
+    schemas = [TOOL_SCHEMAS[name] for name in available_tool_names]
+    planner = model.bind_tools(schemas)
+    if capture_mode == "provenance":
+        planner = FlowceptLLM(
+            planner,
+            agent_id=agent_id,
+            workflow_id=workflow_id,
+            parent_task_id=parent_task_id,
+            return_response_object=True,
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Choose and call the financial evidence tools needed for the task. "
+                f"The target loan_id is {loan_id}; use exactly that value in every tool call. "
+                "Call every source needed for a defensible decision, but do not make the decision yet."
+            ),
+        },
+        {"role": "user", "content": request},
+    ]
+    evidence = []
+    for attempt in range(2):
+        response = planner.invoke(messages)
+        calls = getattr(response, "tool_calls", None) or []
+        failures = []
+        for call in calls:
+            tool_name = SCHEMA_TO_TOOL.get(call.get("name"))
+            if tool_name not in available_tool_names:
+                failures.append(f"Unavailable tool requested: {call.get('name')!r}")
+                continue
+            try:
+                arguments = TOOL_SCHEMAS[tool_name].model_validate(call.get("args") or {}).model_dump()
+            except ValidationError as error:
+                failures.append(f"Invalid arguments for {call.get('name')}: {error}")
+                continue
+            results = functions[tool_name](**arguments) or []
+            evidence.extend(results)
+            if not results or all(
+                str(item.get("item_id", item.get("id", ""))).startswith("tool-error:")
+                for item in results
+                if isinstance(item, dict)
+            ):
+                failures.append(
+                    f"{call.get('name')}({json.dumps(arguments, default=str)}) returned "
+                    f"{json.dumps(results, default=str)[:500]}"
+                )
+        if calls and len(failures) < len(calls):
+            break
+        if attempt == 0:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "No usable evidence was returned. Correct the arguments and call one or more tools again.\n"
+                        + "\n".join(failures or ["No tool was called."])
+                    ),
+                }
+            )
+    usable = [
+        item
+        for item in evidence
+        if not str(item.get("item_id", item.get("id", ""))).startswith("tool-error:")
+    ]
+    if not usable:
+        raise ValueError(f"{agent_id} obtained no evidence from its available tools")
+    return evidence
 
 
 def _record_summary(record) -> dict:
@@ -74,14 +139,26 @@ def _record_summary(record) -> dict:
     }
 
 
-def _validate_record(record, candidate_ids: tuple[str, ...], agent_id: str) -> None:
-    returned = {candidate.candidate_id for candidate in record.candidates}
-    if returned != set(candidate_ids):
-        raise ValueError(
-            f"{agent_id} must return candidates {list(candidate_ids)}; returned {sorted(returned)}"
-        )
+def _validate_record(record, agent_id: str) -> None:
+    if len(record.candidates) < 2:
+        raise ValueError(f"{agent_id} must generate at least two alternatives")
     if len(record.selected_candidate_ids) != 1:
         raise ValueError(f"{agent_id} must select exactly one candidate")
+
+
+def _recommendation_from_record(record) -> str:
+    """Read the benchmark outcome label from the selected, model-generated alternative."""
+    selected_id = record.selected_candidate_ids[0]
+    selected = next(candidate for candidate in record.candidates if candidate.candidate_id == selected_id)
+    content = selected.content if isinstance(selected.content, str) else json.dumps(selected.content)
+    labels = set(re.findall(r"\b(?:approve|decline|manual[_ -]review)\b", content.lower()))
+    normalized = {label.replace(" ", "_").replace("-", "_") for label in labels}
+    if len(normalized) != 1:
+        raise ValueError(
+            "The selected committee alternative must contain exactly one outcome label: "
+            "approve, decline, or manual_review"
+        )
+    return normalized.pop()
 
 
 def _invoke_agent(
@@ -90,12 +167,10 @@ def _invoke_agent(
     role: str,
     question: str,
     request: str,
-    candidate_ids: tuple[str, ...],
     evidence_tool_names: tuple[str, ...],
     tools: FinancialTools,
     loan_id: int,
     model,
-    model_name: str,
     workflow_id: str,
     capture_mode: str,
     prompt_item_chars: int,
@@ -107,12 +182,16 @@ def _invoke_agent(
         activity_id=agent_id,
         agent_id=agent_id,
         workflow_id=workflow_id,
-        used={"role": role, "loan_id": loan_id, "input_entity_ids": input_entity_ids},
+        used={
+            "role": role,
+            "loan_id": loan_id,
+            "input_entity_ids": input_entity_ids,
+            "available_tools": list(evidence_tool_names),
+        },
         capture_telemetry=False,
     ) as agent_task:
-        context = _decision_context(role, question, candidate_ids, model_name)
+        context = {"research_role": role, "question": question}
         functions = tools.captured if capture_mode == "provenance" else tools.baseline
-        baseline_evidence = []
 
         scope = retrieval_scope(
             agent_id=agent_id,
@@ -122,10 +201,18 @@ def _invoke_agent(
         if capture_mode == "provenance":
             scope.__enter__()
         try:
-            for tool_name in evidence_tool_names:
-                results = functions[tool_name](loan_id=loan_id)
-                if capture_mode == "baseline":
-                    baseline_evidence.extend(results)
+            selected_evidence = _choose_and_run_tools(
+                request=request,
+                available_tool_names=evidence_tool_names,
+                functions=functions,
+                loan_id=loan_id,
+                model=model,
+                agent_id=agent_id,
+                workflow_id=workflow_id,
+                parent_task_id=agent_task.get_id(),
+                capture_mode=capture_mode,
+            )
+            baseline_evidence = selected_evidence if capture_mode == "baseline" else []
 
             complaint = None
             record = None
@@ -151,7 +238,7 @@ def _invoke_agent(
                     message += f"\n\nYour previous response was rejected: {complaint}"
                 try:
                     record = capture.invoke(message)
-                    _validate_record(record, candidate_ids, agent_id)
+                    _validate_record(record, agent_id)
                     break
                 except ValueError as error:
                     if attempt == 1:
@@ -179,6 +266,7 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
         case = repository.get_case(loan_id)
         tools = build_financial_tools(
             repository,
+            loan_id,
             config.workflow.recent_transaction_limit,
             config.workflow.comparable_loan_limit,
         )
@@ -201,7 +289,6 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
                     "Assess repayment risk for this historical application without using its hidden outcome. "
                     "Weigh affordability, account behavior, obligations, and prior comparable cases."
                 ),
-                candidate_ids=RISK_CANDIDATES,
                 evidence_tool_names=(
                     "loan_profile",
                     "transaction_summary",
@@ -212,7 +299,6 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
                 tools=tools,
                 loan_id=loan_id,
                 model=model,
-                model_name=config.model.name,
                 workflow_id=workflow_id,
                 capture_mode=config.workflow.capture_mode,
                 prompt_item_chars=config.workflow.prompt_item_chars,
@@ -227,12 +313,10 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
                     "use group history only to identify representational limitations or disparate-risk concerns.\n"
                     + json.dumps(_record_summary(risk.record), indent=2, default=str)
                 ),
-                candidate_ids=FAIRNESS_CANDIDATES,
                 evidence_tool_names=("fairness_context",),
                 tools=tools,
                 loan_id=loan_id,
                 model=model,
-                model_name=config.model.name,
                 workflow_id=workflow_id,
                 capture_mode=config.workflow.capture_mode,
                 prompt_item_chars=config.workflow.prompt_item_chars,
@@ -243,18 +327,18 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
                 role="decision committee synthesizer",
                 question="Which non-binding lending recommendation follows from the evidence and audit?",
                 request=(
-                    "Issue a retrospective research recommendation. Choose manual review whenever evidence is "
-                    "insufficient or the fairness audit identifies a concern.\n\nRISK ASSESSMENT:\n"
+                    "Generate and assess distinct retrospective recommendation alternatives. Each alternative's "
+                    "content must state exactly one outcome label: approve, decline, or manual_review. Select "
+                    "manual_review whenever evidence is insufficient or the fairness audit identifies a concern."
+                    "\n\nRISK ASSESSMENT:\n"
                     + json.dumps(_record_summary(risk.record), indent=2, default=str)
                     + "\n\nFAIRNESS AUDIT:\n"
                     + json.dumps(_record_summary(fairness.record), indent=2, default=str)
                 ),
-                candidate_ids=COMMITTEE_CANDIDATES,
                 evidence_tool_names=("loan_profile", "transaction_summary", "similar_completed_loans"),
                 tools=tools,
                 loan_id=loan_id,
                 model=model,
-                model_name=config.model.name,
                 workflow_id=workflow_id,
                 capture_mode=config.workflow.capture_mode,
                 prompt_item_chars=config.workflow.prompt_item_chars,
@@ -265,7 +349,8 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
             )
 
     agents = [risk, fairness, committee]
-    recommendation = committee.record.selected_candidate_ids[0]
+    recommendation = _recommendation_from_record(committee.record)
+    tasks = [message for message in Flowcept.buffer if message.get("workflow_id") == workflow_id]
     return {
         "workflow_id": workflow_id,
         "loan_id": loan_id,
@@ -274,6 +359,7 @@ def run_case(config: ExperimentConfig, loan_id: int, model=None) -> dict:
         "hidden_outcome": case.outcome,
         "recommendation": recommendation,
         "evaluation": evaluate_recommendation(case.outcome, recommendation),
+        "tasks": tasks,
         "agents": [
             {
                 "agent_id": result.agent_id,
