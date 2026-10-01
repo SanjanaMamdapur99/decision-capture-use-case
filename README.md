@@ -30,67 +30,83 @@ restricted to cases dated before the target loan.
 
 ## Recommended environment
 
-- Linux GPU host with Git, `curl`, and Python 3.11 or 3.12.
-- A supported NVIDIA or AMD GPU and current drivers.
-- Ollama running on the same host as this workflow.
+- Windows 10 22H2 or newer with PowerShell.
+- Python 3.11 or 3.12 and Git.
+- A supported NVIDIA GPU with a current NVIDIA driver.
+- Ollama for Windows running on the same server as this workflow.
 - Internet access during setup to download Python dependencies, Flowcept, the model, and database.
 
 Ollama's current platform and GPU requirements are documented in its
-[Linux installation guide](https://docs.ollama.com/linux) and
+[Windows installation guide](https://docs.ollama.com/windows) and
 [hardware support guide](https://docs.ollama.com/gpu).
 
-## Complete Linux GPU setup
+## Complete Windows PowerShell setup
 
-Run these sections in order.
+Run every section below in order on the Windows GPU server. Use the same PowerShell session after
+activating the virtual environment and setting the environment variables.
 
-### 1. Verify the host
+### 1. Install the prerequisites
 
-```bash
-git --version
-python3 --version
-curl --version
+If Git or Python 3.11 is not already installed, install them with Windows Package Manager:
+
+```powershell
+winget install --exact --id Git.Git
+winget install --exact --id Python.Python.3.11
 ```
 
-For NVIDIA:
+Install Ollama for Windows:
 
-```bash
+```powershell
+winget install --exact --id Ollama.Ollama
+```
+
+If `winget` cannot find Ollama, use the official
+[Ollama Windows installer](https://ollama.com/download/windows).
+
+Close PowerShell after installation, open a new PowerShell window, and verify the tools:
+
+```powershell
+git --version
+py -3.11 --version
+ollama --version
 nvidia-smi
 ```
 
-For AMD ROCm:
+Update the NVIDIA driver before continuing if `nvidia-smi` cannot see the GPU. Ollama's Windows
+documentation currently requires a sufficiently recent NVIDIA driver for GPU acceleration.
 
-```bash
-rocminfo
+### 2. Verify the Ollama server
+
+The Windows Ollama application normally starts in the background and serves
+`http://localhost:11434`.
+
+```powershell
+Invoke-RestMethod http://localhost:11434/api/tags
 ```
 
-Install or update the GPU driver before continuing if the relevant command cannot see the GPU.
+If that request fails, start Ollama in a dedicated PowerShell window and leave it running:
 
-### 2. Install and start Ollama
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-sudo systemctl enable --now ollama
-ollama --version
-curl --fail http://localhost:11434/api/tags
-```
-
-On a host without `systemd`, start the server in a dedicated terminal instead:
-
-```bash
+```powershell
 ollama serve
 ```
 
-Leave that terminal running.
-
 ### 3. Clone the repository and create a virtual environment
 
-```bash
+```powershell
 git clone https://github.com/SanjanaMamdapur99/decision-capture-use-case.git
-cd decision-capture-use-case
-python3 -m venv .venv
-source .venv/bin/activate
+Set-Location decision-capture-use-case
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e .
+```
+
+If PowerShell blocks virtual-environment activation, allow scripts only for the current process and
+retry activation:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
 The editable install automatically installs the `llm_agent` and `mongo` extras from the pinned
@@ -99,7 +115,7 @@ top of this environment.
 
 Confirm the expected branch implementation is importable:
 
-```bash
+```powershell
 python -c "from flowcept import DecisionCapture, flowcept_tool, retrieval_scope; print('Flowcept decision capture ready')"
 ```
 
@@ -107,18 +123,18 @@ python -c "from flowcept import DecisionCapture, flowcept_tool, retrieval_scope;
 
 The 71 MB SQLite database is intentionally not stored in Git. Download the pinned BIRD copy:
 
-```bash
-mkdir -p data/financial
-curl --fail --location \
-  "https://huggingface.co/datasets/prem-research/birdbench/resolve/03abfc646adfd2ff0ab33ef69df16579446d6572/validation/dev_databases/financial/financial.sqlite?download=true" \
-  --output data/financial/financial.sqlite
-sha256sum data/financial/financial.sqlite
+```powershell
+New-Item -ItemType Directory -Force data\financial | Out-Null
+curl.exe --fail --location `
+  "https://huggingface.co/datasets/prem-research/birdbench/resolve/03abfc646adfd2ff0ab33ef69df16579446d6572/validation/dev_databases/financial/financial.sqlite?download=true" `
+  --output data\financial\financial.sqlite
+Get-FileHash -Algorithm SHA256 data\financial\financial.sqlite
 ```
 
 Expected SHA-256:
 
 ```text
-d15d89cdb068a202b6f2b99342af44dffc1d52545b39ceaf62efdc0ba570101e
+D15D89CDB068A202B6F2B99342AF44DFFC1D52545B39CEAF62EFDC0BA570101E
 ```
 
 The source dataset is the PKDD'99 Czech financial dataset. The pinned database copy is published
@@ -128,8 +144,8 @@ through the [BIRD benchmark dataset](https://huggingface.co/datasets/prem-resear
 
 The default experiment uses Flowcept's offline profile. Redis and MongoDB are not required.
 
-```bash
-export FLOWCEPT_SETTINGS_PATH="$PWD/settings.yaml"
+```powershell
+$env:FLOWCEPT_SETTINGS_PATH = "$PWD\settings.yaml"
 flowcept --init-settings --full -y
 flowcept --config-profile full-offline -y
 ```
@@ -139,7 +155,7 @@ machine-local and ignored by Git.
 
 ### 6. Pull the recommended Ollama model
 
-```bash
+```powershell
 ollama pull qwen3:8b
 ollama list
 ```
@@ -151,27 +167,27 @@ reasoning-control support. Ollama documents these fields in its
 
 Set the local placeholder API key expected by OpenAI-compatible clients:
 
-```bash
-export DECISION_LLM_API_KEY=ollama
+```powershell
+$env:DECISION_LLM_API_KEY = "ollama"
 ```
 
 Ollama ignores this value for local requests.
 
 ### 7. Run the deterministic tests
 
-```bash
+```powershell
 python -m unittest discover -s tests -v
 ```
 
 ### 8. Run one smoke-test loan
 
-```bash
+```powershell
 python -m decision_use_case.main --config experiment.yaml --loan-id 5358
 ```
 
 While it is running, use another terminal to verify GPU placement:
 
-```bash
+```powershell
 ollama ps
 nvidia-smi
 ```
@@ -181,54 +197,12 @@ Ollama process and allocated VRAM.
 
 ### 9. Run the complete configured experiment
 
-```bash
+```powershell
 python -m decision_use_case.main --config experiment.yaml
 ```
 
 The default configuration evaluates four historical loans. Each loan runs three agents and may
 make several model calls, so the full experiment takes materially longer than the smoke test.
-
-## Windows PowerShell setup
-
-Install Ollama using the official
-[Windows installer](https://ollama.com/download/windows). Ollama runs in the background and serves
-the API on `http://localhost:11434`.
-
-Then run:
-
-```powershell
-ollama --version
-ollama pull qwen3:8b
-Invoke-RestMethod http://localhost:11434/api/tags
-
-git clone https://github.com/SanjanaMamdapur99/decision-capture-use-case.git
-Set-Location decision-capture-use-case
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .
-
-New-Item -ItemType Directory -Force data\financial | Out-Null
-curl.exe --fail --location `
-  "https://huggingface.co/datasets/prem-research/birdbench/resolve/03abfc646adfd2ff0ab33ef69df16579446d6572/validation/dev_databases/financial/financial.sqlite?download=true" `
-  --output data\financial\financial.sqlite
-Get-FileHash -Algorithm SHA256 data\financial\financial.sqlite
-
-$env:FLOWCEPT_SETTINGS_PATH = "$PWD\settings.yaml"
-flowcept --init-settings --full -y
-flowcept --config-profile full-offline -y
-$env:DECISION_LLM_API_KEY = "ollama"
-
-python -m unittest discover -s tests -v
-python -m decision_use_case.main --config experiment.yaml --loan-id 5358
-python -m decision_use_case.main --config experiment.yaml
-```
-
-Expected database hash:
-
-```text
-D15D89CDB068A202B6F2B99342AF44DFFC1D52545B39CEAF62EFDC0BA570101E
-```
 
 ## Configuration
 
@@ -251,7 +225,7 @@ workflow:
 
 To try another Ollama model, first pull it and then change `model.name`:
 
-```bash
+```powershell
 ollama pull qwen3:14b
 ```
 
@@ -285,25 +259,24 @@ latency, abstention, and retrospective recommendation accuracy.
 
 ### `Connection refused` for port 11434
 
-```bash
-sudo systemctl status ollama
-sudo systemctl restart ollama
-curl --fail http://localhost:11434/api/tags
+```powershell
+Get-Process ollama -ErrorAction SilentlyContinue
+Invoke-RestMethod http://localhost:11434/api/tags
 ```
 
-Without `systemd`, run `ollama serve` in another terminal.
+If Ollama is not running, launch the Ollama Windows application or run `ollama serve` in a separate
+PowerShell window.
 
 ### Model runs on CPU
 
-Check `ollama ps` and the vendor tool (`nvidia-smi` or `rocminfo`). Update the driver and verify
-that the GPU is supported by Ollama. On multi-GPU NVIDIA hosts, select devices before starting the
-Ollama service with `CUDA_VISIBLE_DEVICES` if necessary.
+Check `ollama ps` and `nvidia-smi`. Update the NVIDIA driver and verify that the GPU is supported by
+Ollama. Restart Ollama after changing GPU-related environment variables or drivers.
 
 ### Database missing
 
-```bash
-ls -lh data/financial/financial.sqlite
-sha256sum data/financial/financial.sqlite
+```powershell
+Get-Item data\financial\financial.sqlite
+Get-FileHash -Algorithm SHA256 data\financial\financial.sqlite
 ```
 
 Re-run the pinned download command if the file is absent or the hash differs.
@@ -312,7 +285,7 @@ Re-run the pinned download command if the file is absent or the hash differs.
 
 Confirm that `experiment.yaml` names a downloaded, tool-capable model:
 
-```bash
+```powershell
 ollama list
 ollama show qwen3:8b
 ```
@@ -324,7 +297,7 @@ Then retry the single-loan smoke test before launching all four cases.
 Reinstall this project inside the active virtual environment. This reinstalls Flowcept from the
 pinned Git branch declared in `pyproject.toml`:
 
-```bash
+```powershell
 python -m pip uninstall -y flowcept decision-capture-use-case
 python -m pip install -e .
 ```
